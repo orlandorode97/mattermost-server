@@ -33,14 +33,23 @@ func newSqlThreadStore(sqlStore *SqlStore) store.ThreadStore {
 
 func (s *SqlThreadStore) Get(id string) (*model.Thread, error) {
 	var thread model.Thread
+
 	query, args, err := s.getQueryBuilder().
-		Select("*").
+		Select(
+			"Threads.PostId",
+			"Threads.ChannelId",
+			"Threads.ReplyCount",
+			"Threads.LastReplyAt",
+			"Threads.Participants",
+			"COALESCE(Threads.DeleteAt, 0) AS DeleteAt",
+		).
 		From("Threads").
 		Where(sq.Eq{"PostId": id}).
 		ToSql()
 	if err != nil {
 		return nil, errors.Wrap(err, "thread_tosql")
 	}
+
 	err = s.GetMasterX().Get(&thread, query, args...)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -218,10 +227,19 @@ func (s *SqlThreadStore) GetThreadsForUser(userId, teamId string, opts model.Get
 	}
 
 	query := s.getQueryBuilder().
-		Select(`Threads.*,
-				` + postSliceCoalesceQuery() + `,
-				ThreadMemberships.LastViewed as LastViewedAt,
-				ThreadMemberships.UnreadMentions as UnreadMentions`).
+		Select(
+			"Threads.PostId",
+			"Threads.ChannelId",
+			"Threads.ReplyCount",
+			"Threads.LastReplyAt",
+			"Threads.Participants",
+			"COALESCE(Threads.DeleteAt, 0) AS DeleteAt",
+		).
+		Column(postSliceCoalesceQuery()).
+		Columns(
+			"ThreadMemberships.LastViewed as LastViewedAt",
+			"ThreadMemberships.UnreadMentions as UnreadMentions",
+		).
 		From("Threads").
 		Column(sq.Alias(sq.Expr(unreadRepliesSql, unreadRepliesArgs...), "UnreadReplies")).
 		Join("Posts ON Posts.Id = Threads.PostId").
@@ -256,11 +274,11 @@ func (s *SqlThreadStore) GetThreadsForUser(userId, teamId string, opts model.Get
 
 	order := "DESC"
 	if opts.Before != "" {
-		query = query.Where(sq.Expr(`LastReplyAt < (SELECT LastReplyAt FROM Threads WHERE PostId = ?)`, opts.Before))
+		query = query.Where(sq.Expr(`Threads.LastReplyAt < (SELECT LastReplyAt FROM Threads WHERE PostId = ?)`, opts.Before))
 	}
 	if opts.After != "" {
 		order = "ASC"
-		query = query.Where(sq.Expr(`LastReplyAt > (SELECT LastReplyAt FROM Threads WHERE PostId = ?)`, opts.After))
+		query = query.Where(sq.Expr(`Threads.LastReplyAt > (SELECT LastReplyAt FROM Threads WHERE PostId = ?)`, opts.After))
 	}
 
 	query = query.
@@ -475,6 +493,7 @@ func (s *SqlThreadStore) GetThreadForUser(teamId string, threadMembership *model
 		UnreadReplies  int64
 		UnreadMentions int64
 		Participants   model.StringArray
+		DeleteAt       int64
 		model.Post
 	}
 
@@ -495,21 +514,35 @@ func (s *SqlThreadStore) GetThreadForUser(teamId string, threadMembership *model
 		sq.Eq{"Threads.PostId": threadMembership.PostId},
 	}
 
+	query := s.getQueryBuilder().
+		Select(
+			"Threads.PostId",
+			"Threads.ChannelId",
+			"Threads.ReplyCount",
+			"Threads.LastReplyAt",
+			"Threads.Participants",
+			"COALESCE(Threads.DeleteAt, 0) AS DeleteAt",
+		).
+		From("Threads")
+
+	for _, c := range postSliceColumns() {
+		query = query.Column("Posts." + c)
+	}
+
 	var thread JoinedThread
-	query, threadArgs, err := s.getQueryBuilder().
-		Select("Threads.*, Posts.*").
-		From("Threads").
+	querySQL, threadArgs, err := query.
 		Column(sq.Alias(sq.Expr(unreadRepliesQuery), "UnreadReplies")).
 		LeftJoin("Posts ON Posts.Id = Threads.PostId").
 		LeftJoin("Channels ON Posts.ChannelId = Channels.Id").
-		Where(fetchConditions).ToSql()
+		Where(fetchConditions).
+		ToSql()
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to build query to get thread for user id=%s, post id=%s", threadMembership.UserId, threadMembership.PostId)
 	}
 
 	args := append(unreadRepliesArgs, threadArgs...)
 
-	err = s.GetReplicaX().Get(&thread, query, args...)
+	err = s.GetReplicaX().Get(&thread, querySQL, args...)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, store.NewErrNotFound("Thread", threadMembership.PostId)
@@ -556,6 +589,7 @@ func (s *SqlThreadStore) GetThreadForUser(teamId string, threadMembership *model
 		UnreadMentions: thread.UnreadMentions,
 		Participants:   participants,
 		Post:           thread.Post.ToNilIfInvalid(),
+		DeleteAt:       thread.DeleteAt,
 	}
 
 	return result, nil
